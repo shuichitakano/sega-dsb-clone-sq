@@ -1,0 +1,67 @@
+; I2S 
+; side set: BCK
+; set : LRCK
+; out : DATA 
+;
+.program send_i2s_48fs
+.side_set 1
+
+; LRCK: --______...____------...----____
+; BCK:  _-_-_-_-..._-_-_-_-_-..._-_-_-_-
+; DATA: 1100FFEE...221100FFEE...221100FF
+
+    set x, 15           side 1    
+loop0:
+    out pins, 1         side 0
+    jmp x--, loop0      side 1
+
+    mov pins, null      side 0
+    set x, 5            side 1
+
+loop1:
+    nop                 side 0
+    jmp x--, loop1      side 1
+
+    set pins, 1         side 0  ; LRCK H
+    set x, 15           side 1    
+
+loop2:
+    out pins, 1         side 0
+    jmp x--, loop2      side 1
+
+    mov pins, null      side 0
+    set x, 5            side 1
+
+loop3:
+    nop                 side 0
+    jmp x--, loop3      side 1
+
+    set pins, 0         side 0  ; LRCK L
+
+
+% c-sdk {
+static inline void
+initProgramSendI2S48fs(PIO pio, uint sm, uint offset,
+                       uint pinLRCK, uint pinBCK, uint pinDATA)
+{
+    pio_sm_set_consecutive_pindirs(pio, sm, pinLRCK, 1, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, pinBCK, 1, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, pinDATA, 1, true);
+
+    pio_gpio_init(pio, pinLRCK);
+    pio_gpio_init(pio, pinBCK);
+    pio_gpio_init(pio, pinDATA);
+
+    pio_sm_config c = send_i2s_48fs_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, pinDATA, 1);
+    sm_config_set_set_pins(&c, pinLRCK, 1);
+    sm_config_set_sideset_pins(&c, pinBCK);
+    sm_config_set_out_shift(&c, false /* right */, true /* auto */, 32);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+ 
+
+
+
