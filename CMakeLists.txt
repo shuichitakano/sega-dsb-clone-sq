@@ -28,7 +28,13 @@ pico_sdk_init()
 add_executable(sega-dsb-clone-sq
   main.cpp
   hw_config.cpp
+  thirdparty/picomp3lib/interface/music_file.c
   )
+
+set_source_files_properties(
+  thirdparty/picomp3lib/interface/music_file.c
+  PROPERTIES COMPILE_FLAGS "-w"
+)
 
 pico_generate_pio_header(sega-dsb-clone-sq ${CMAKE_CURRENT_LIST_DIR}/i2s.pio)
 
@@ -62,13 +68,14 @@ target_compile_options(picomp3lib INTERFACE
 
 # Add any user requested libraries
 target_link_libraries(sega-dsb-clone-sq
-        hardware_dma
-        hardware_pio
-        hardware_interp
-        hardware_clocks
-        no-OS-FatFS-SD-SDIO-SPI-RPi-Pico
-        picomp3lib
-        )
+  pico_multicore
+  hardware_dma
+  hardware_pio
+  hardware_interp
+  hardware_clocks
+  no-OS-FatFS-SD-SDIO-SPI-RPi-Pico
+  picomp3lib
+)
 
 pico_add_extra_outputs(sega-dsb-clone-sq)
 

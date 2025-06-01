@@ -1,15 +1,29 @@
+
 #include <stdio.h>
-#include "pico/stdlib.h"
-#include "hardware/dma.h"
-#include "hardware/pio.h"
-#include "hardware/interp.h"
-#include "hardware/clocks.h"
+#include <pico/stdlib.h>
+#include <pico/multicore.h>
+#include <hardware/dma.h>
+#include <hardware/pio.h>
+#include <hardware/interp.h>
+#include <hardware/clocks.h>
+#include <hardware/vreg.h>
 #include <cmath>
 #include "i2s.pio.h"
+#include "mutex.h"
 
 #include "hw_config.h"
 #include "f_util.h"
 #include "ff.h"
+
+extern "C"
+{
+#include "music_file.h"
+}
+
+#include <string>
+#include <deque>
+#include <vector>
+#include <mutex>
 
 namespace
 {
@@ -22,13 +36,42 @@ namespace
     constexpr int PIN_XSMT = 12;
 
     constexpr int sampleFreq = 44100;
+    constexpr int DMA_CH_I2S = 2; // SDで0,1つかう
 
-    constexpr int DMA_CH_I2S = 0;
+    constexpr size_t WAVE_BUFFER_SIZE = 3000;
+    constexpr size_t WAVE_RING_SIZE = 4;
 
-    constexpr size_t WAVE_BUFFER_SIZE = 512;
-    uint32_t waveBuffer_[2][WAVE_BUFFER_SIZE];
+    struct WaveBufferUnit
+    {
+        uint32_t data[WAVE_BUFFER_SIZE];
+        size_t size = 0;
+    };
 
-    int i2sDBID_ = 0;
+    WaveBufferUnit waveBuffer_[WAVE_RING_SIZE];
+    size_t waveOutRingID_ = 0;
+    size_t waveInRingID_ = 0;
+
+    bool dmaTransferInProgress_ = false;
+
+    bool isWaveInFull()
+    {
+        return (waveInRingID_ + 1) % WAVE_RING_SIZE == waveOutRingID_;
+    }
+
+    bool isWaveOutEmpty()
+    {
+        return waveInRingID_ == waveOutRingID_;
+    }
+
+    [[maybe_unused]] void nextWaveIn()
+    {
+        waveInRingID_ = (waveInRingID_ + 1) % WAVE_RING_SIZE;
+    }
+
+    void nextWaveOut()
+    {
+        waveOutRingID_ = (waveOutRingID_ + 1) % WAVE_RING_SIZE;
+    }
 }
 
 namespace
@@ -65,35 +108,19 @@ namespace
         dma_channel_set_irq1_enabled(DMA_CH_I2S, f);
     }
 
-    void updateWaveBuffer()
+    bool startTransferI2S()
     {
-        static float phase = {};
-        constexpr float phaseStep = 2 * 3.14159265f * 440 / 44100;
-
-        auto *dst = waveBuffer_[i2sDBID_];
-        auto *tail = dst + WAVE_BUFFER_SIZE;
-        do
+        if (isWaveOutEmpty())
         {
-            float st = sinf(phase);
-            float sc = cosf(phase);
-            float scale = 32767.0f / 6;
-            uint16_t l = static_cast<int>(st * scale);
-            uint16_t r = static_cast<int>(sc * scale);
+            return false;
+        }
 
-            *dst++ = (l << 16) | r;
-            phase += phaseStep;
-        } while (dst != tail);
-    }
-
-    void startTransferI2S()
-    {
-        dma_channel_set_trans_count(DMA_CH_I2S, WAVE_BUFFER_SIZE, false);
-        dma_channel_set_read_addr(DMA_CH_I2S, waveBuffer_[i2sDBID_], true);
-    }
-
-    void flipI2SBuffer()
-    {
-        i2sDBID_ ^= 1;
+        auto &wb = waveBuffer_[waveOutRingID_];
+        dma_channel_set_trans_count(DMA_CH_I2S, wb.size, false);
+        dma_channel_set_read_addr(DMA_CH_I2S, wb.data, true);
+        nextWaveOut();
+        dmaTransferInProgress_ = true;
+        return true;
     }
 
     void __isr __not_in_flash_func(i2sDMAIRQHandler)()
@@ -106,12 +133,7 @@ namespace
             setLED(led);
             led ^= true;
 
-            // 更新済みのバッファを転送
-            startTransferI2S();
-
-            // 次のバッファを更新
-            flipI2SBuffer();
-            updateWaveBuffer();
+            dmaTransferInProgress_ = startTransferI2S();
         }
     }
 
@@ -124,7 +146,6 @@ namespace
         // auto divider = clock * 256 / (sampleFreq * 2 * 24 * 2;
         auto divider = clock * 8 / (sampleFreq * 3);
         // 125000000*256/(44100*2*24*2) = 7558.578987150416
-        assert(divider < 0x1000000);
         auto divFrac = divider & 0xffu;
         auto divInt = divider >> 8u;
         printf("I2S clock divider: %d %d.%02d\n", (int)divider, (int)divInt, (int)divFrac);
@@ -147,7 +168,7 @@ namespace
         FRESULT fr = f_mount(&fs, "", 1);
         if (FR_OK != fr)
         {
-            panic("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
+            panic("f_mount error: %d\n", fr);
         }
 
         // Open a file and write to it
@@ -173,10 +194,221 @@ namespace
         // Unmount the SD card
         f_unmount("");
     }
+
+    [[maybe_unused]] void fstest2()
+    {
+        DIR dir;
+        auto fr = f_opendir(&dir, "/");
+
+        if (FR_OK != fr)
+        {
+            printf("f_opendir error: %d\n", fr);
+            return;
+        }
+        FILINFO fno;
+        while (true)
+        {
+            fr = f_readdir(&dir, &fno);
+            if (FR_OK != fr)
+            {
+                printf("f_readdir error: %d\n", fr);
+                return;
+            }
+            if (fno.fname[0] == 0) // end of directory
+            {
+                break;
+            }
+
+            printf("File: %s, Size: %llu\n", fno.fname, fno.fsize);
+        }
+        fr = f_closedir(&dir);
+        if (FR_OK != fr)
+        {
+            printf("f_closedir error: %d\n", fr);
+            return;
+        }
+        printf("Directory listing completed\n");
+    }
+
+    // main
+
+    struct Request
+    {
+        std::string loadFile;
+    };
+
+    Mutex mutex_;
+    Request request_;
+
+    constexpr size_t MP3_WORKING_SIZE = 16000;
+    constexpr size_t MP3_DECODE_BUFFER_SIZE = WAVE_BUFFER_SIZE * 2;
+    int16_t mp3DecodeBuffer_[MP3_DECODE_BUFFER_SIZE];
+    uint8_t mp3Working_[MP3_WORKING_SIZE];
+
+    void setRequest(Request &&req)
+    {
+        std::lock_guard<Mutex> lock(mutex_);
+        request_ = std::move(req);
+    }
+
+    Request popRequest()
+    {
+        std::lock_guard<Mutex> lock(mutex_);
+        Request req = std::move(request_);
+        request_ = {};
+        return req;
+    }
+
+    struct MP3Player
+    {
+        music_file mf_;
+        uint32_t sampleRate_ = 0;
+        int nChannels_ = 0;
+        bool opened_ = false;
+
+        void open(const std::string &filename)
+        {
+            close();
+
+            if (!musicFileCreate(&mf_, filename.c_str(), mp3Working_, MP3_WORKING_SIZE))
+            {
+                printf("mp3FileCreate error: %s\n", filename.c_str());
+                return;
+            }
+
+            sampleRate_ = musicFileGetSampleRate(&mf_);
+            nChannels_ = musicFileGetChannels(&mf_);
+            printf("MP3 file: %s, sample rate: %lu, channels: %d\n",
+                   filename.c_str(), sampleRate_, nChannels_);
+
+            opened_ = true;
+        }
+
+        void close()
+        {
+            if (opened_)
+            {
+                musicFileClose(&mf_);
+                opened_ = false;
+                printf("MP3 file closed\n");
+            }
+        }
+
+        void tick()
+        {
+            if (!opened_ || isWaveInFull())
+            {
+                return;
+            }
+
+            uint32_t written = 0;
+            if (musicFileRead(&mf_, mp3DecodeBuffer_, MP3_DECODE_BUFFER_SIZE, &written))
+            {
+                if (written > 0)
+                {
+                    // printf("MP3 file read %lu samples\n", written);
+                    auto &wb = waveBuffer_[waveInRingID_];
+                    auto *dst = wb.data;
+                    const auto *src = mp3DecodeBuffer_;
+                    auto *srcTail = src + written;
+
+                    int scale = 32768 / 6;
+                    if (nChannels_ == 2)
+                    {
+                        // Stereo
+                        do
+                        {
+                            int l = src[0] * scale >> 15;
+                            int r = src[1] * scale >> 15;
+                            *dst = (l << 16) | (r & 0xffff);
+                            ++dst;
+                            src += 2;
+                        } while (src < srcTail);
+                        wb.size = written >> 1;
+                    }
+                    else
+                    {
+                        // Mono
+                        do
+                        {
+                            int s = *src++ * scale >> 15;
+                            *dst = (s << 16) | (s & 0xffff);
+                        } while (src < srcTail);
+                        wb.size = written;
+                    }
+                    nextWaveIn();
+
+                    if (!dmaTransferInProgress_)
+                    {
+                        startTransferI2S();
+                    }
+                }
+                else
+                {
+                    printf("MP3 file read finished\n");
+                    close();
+                }
+            }
+            else
+            {
+                printf("Error reading MP3 file\n");
+                close();
+            }
+        }
+    };
+
+    void __not_in_flash_func(core0_main)()
+    {
+        {
+            Request r;
+            r.loadFile = "test.mp3";
+            setRequest(std::move(r));
+        }
+
+        while (1)
+            ;
+    }
+
+    void __not_in_flash_func(core1_main)()
+    {
+        MP3Player player;
+
+        FATFS fs;
+        FRESULT fr = f_mount(&fs, "", 1);
+        if (FR_OK != fr)
+        {
+            panic("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
+        }
+
+        fstest2();
+
+        while (1)
+        {
+            auto req = popRequest();
+            if (!req.loadFile.empty())
+            {
+                printf("Request to load file: %s\n", req.loadFile.c_str());
+                player.open(req.loadFile);
+            }
+
+            player.tick();
+        }
+    }
+
 }
 
 int main()
 {
+#if 0
+    vreg_set_voltage(VREG_VOLTAGE_1_20);
+    sleep_ms(10);
+    bool clock_set = set_sys_clock_khz(266000, true);
+    if (!clock_set)
+    {
+        panic("Failed to set system clock");
+    }
+#endif
+
     stdio_init_all();
 
     printf("DSB Clone^2\n");
@@ -192,21 +424,10 @@ int main()
     printf("init I2S...\n");
     initI2S();
 
-    printf("update wave buffer...\n");
-    updateWaveBuffer();
-    flipI2SBuffer();
-    updateWaveBuffer();
-
     enableIRQI2SDMA(true);
 
-    printf("start transfer...\n");
-    flipI2SBuffer();
-    startTransferI2S();
-    flipI2SBuffer();
-
-    while (1)
-    {
-    }
+    multicore_launch_core1(core1_main);
+    core0_main();
 
     return 0;
 }
