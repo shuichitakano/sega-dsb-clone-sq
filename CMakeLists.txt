@@ -27,6 +27,7 @@ pico_sdk_init()
 
 add_executable(sega-dsb-clone-sq
   main.cpp
+  hw_config.cpp
   )
 
 pico_generate_pio_header(sega-dsb-clone-sq ${CMAKE_CURRENT_LIST_DIR}/i2s.pio)
@@ -47,12 +48,26 @@ target_include_directories(sega-dsb-clone-sq PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/.. # for our common lwipopts or any other standard includes, if required
 )
 
+target_compile_options(sega-dsb-clone-sq PRIVATE
+  -Wall -Wextra -Werror
+  -Wno-missing-field-initializers
+)
+
+add_subdirectory(thirdparty/no-OS-FatFS-SD-SDIO-SPI-RPi-Pico/src)
+add_subdirectory(thirdparty/picomp3lib/src)
+
+target_compile_options(picomp3lib INTERFACE 
+  -Wno-unused-parameter
+ )
+
 # Add any user requested libraries
 target_link_libraries(sega-dsb-clone-sq
         hardware_dma
         hardware_pio
         hardware_interp
         hardware_clocks
+        no-OS-FatFS-SD-SDIO-SPI-RPi-Pico
+        picomp3lib
         )
 
 pico_add_extra_outputs(sega-dsb-clone-sq)
