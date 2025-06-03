@@ -21,9 +21,8 @@ extern "C"
 }
 
 #include <string>
-#include <deque>
-#include <vector>
 #include <mutex>
+#include <map>
 
 namespace
 {
@@ -232,13 +231,79 @@ namespace
 
     // main
 
+    class TrackHolder
+    {
+        std::map<int, std::string> trackMap_;
+
+    public:
+        void init(const char *path)
+        {
+            printf("Parse contents of %s\n", path);
+            DIR dir;
+            auto fr = f_opendir(&dir, path);
+            if (FR_OK != fr)
+            {
+                printf("f_opendir error: %d\n", fr);
+                return;
+            }
+
+            while (true)
+            {
+                FILINFO fno;
+                fr = f_readdir(&dir, &fno);
+                if (FR_OK != fr)
+                {
+                    printf("f_readdir error: %d\n", fr);
+                    return;
+                }
+                if (fno.fname[0] == 0) // end of directory
+                {
+                    break;
+                }
+
+                const char *fname = fno.fname;
+                printf("File: %s, Size: %llu\n", fname, fno.fsize);
+
+                auto l = strlen(fname);
+                if (l >= 4 && strcmp(fname + l - 4, ".mp3") == 0)
+                {
+                    int trackNum = 0;
+                    if (sscanf(fname, "%d_", &trackNum) == 1)
+                    {
+                        trackMap_[trackNum] = std::string(path) + "/" + fname;
+                        printf("  Track %d: %s\n", trackNum, fname);
+                    }
+                }
+            }
+            fr = f_closedir(&dir);
+            if (FR_OK != fr)
+            {
+                printf("f_closedir error: %d\n", fr);
+                return;
+            }
+            printf("done.\n");
+        }
+
+        const char *getTrack(int trackNum) const
+        {
+            auto it = trackMap_.find(trackNum);
+            if (it != trackMap_.end())
+            {
+                return it->second.c_str();
+            }
+            return nullptr;
+        }
+    };
+
     struct Request
     {
         std::string loadFile;
+        int loadTrack = -1;
     };
 
     Mutex mutex_;
     Request request_;
+    TrackHolder trackHolder_;
 
     constexpr size_t MP3_WORKING_SIZE = 16000;
     constexpr size_t MP3_DECODE_BUFFER_SIZE = WAVE_BUFFER_SIZE * 2;
@@ -357,18 +422,6 @@ namespace
         }
     };
 
-    void __not_in_flash_func(core0_main)()
-    {
-        {
-            Request r;
-            r.loadFile = "test.mp3";
-            setRequest(std::move(r));
-        }
-
-        while (1)
-            ;
-    }
-
     void __not_in_flash_func(core1_main)()
     {
         MP3Player player;
@@ -380,7 +433,8 @@ namespace
             panic("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
         }
 
-        fstest2();
+        // fstest2();
+        trackHolder_.init("/dsb");
 
         while (1)
         {
@@ -390,6 +444,19 @@ namespace
                 printf("Request to load file: %s\n", req.loadFile.c_str());
                 player.open(req.loadFile);
             }
+            else if (req.loadTrack > 0)
+            {
+                printf("Request to load track: %d\n", req.loadTrack);
+                auto *trackFile = trackHolder_.getTrack(req.loadTrack);
+                if (trackFile)
+                {
+                    player.open(trackFile);
+                }
+                else
+                {
+                    printf("Track %d not found\n", req.loadTrack);
+                }
+            }
 
             player.tick();
         }
@@ -397,12 +464,50 @@ namespace
 
 }
 
+void __not_in_flash_func(core0_main)()
+{
+    if (0)
+    {
+        Request r;
+        r.loadFile = "test.mp3";
+        setRequest(std::move(r));
+    }
+
+    std::string str;
+    while (1)
+    {
+        auto ch = getchar_timeout_us(0);
+        if (ch == PICO_ERROR_TIMEOUT)
+        {
+            // No input, continue
+            sleep_ms(10);
+            continue;
+        }
+        if (ch == '\r' || ch == '\n')
+        {
+            printf("enter!!!! %s\n", str.c_str());
+            int num = atoi(str.c_str());
+            if (num > 0)
+            {
+                Request r;
+                r.loadTrack = num;
+                setRequest(std::move(r));
+            }
+            str.clear();
+        }
+        else
+        {
+            str.push_back(ch);
+        }
+    }
+}
+
 int main()
 {
-#if 0
-    vreg_set_voltage(VREG_VOLTAGE_1_20);
+#if 1
+    // vreg_set_voltage(VREG_VOLTAGE_1_20);
     sleep_ms(10);
-    bool clock_set = set_sys_clock_khz(266000, true);
+    bool clock_set = set_sys_clock_khz(140000, true);
     if (!clock_set)
     {
         panic("Failed to set system clock");
