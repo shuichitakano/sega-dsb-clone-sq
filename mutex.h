@@ -1,4 +1,6 @@
 //
+#pragma once
+
 #include <pico/critical_section.h>
 
 class Mutex

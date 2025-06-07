@@ -7,9 +7,11 @@
 #include <hardware/interp.h>
 #include <hardware/clocks.h>
 #include <hardware/vreg.h>
+#include <hardware/uart.h>
 #include <cmath>
 #include "i2s.pio.h"
 #include "mutex.h"
+#include "midi.h"
 
 #include "hw_config.h"
 #include "f_util.h"
@@ -23,6 +25,9 @@ extern "C"
 #include <string>
 #include <mutex>
 #include <map>
+#include <array>
+#include <cmath>
+#include <algorithm>
 
 namespace
 {
@@ -33,6 +38,10 @@ namespace
     constexpr int PIN_BCK = 15;
     constexpr int PIN_DATA = 14;
     constexpr int PIN_XSMT = 12;
+
+    auto *midiUART = uart1;
+    constexpr int MIDI_BAUDRATE = 31250;
+    constexpr int MIDI_RX_PIN = 5;
 
     constexpr int sampleFreq = 44100;
     constexpr int DMA_CH_I2S = 2; // SDで0,1つかう
@@ -159,6 +168,14 @@ namespace
         channel_config_set_read_increment(&config, true);
         channel_config_set_write_increment(&config, false);
         dma_channel_configure(DMA_CH_I2S, &config, &pioI2S->txf[SM_I2S], nullptr, 0, false);
+    }
+
+    void initMIDI()
+    {
+        uart_init(midiUART, MIDI_BAUDRATE);
+        gpio_set_function(MIDI_RX_PIN, GPIO_FUNC_UART);
+        uart_set_format(midiUART, 8, 1, UART_PARITY_NONE);
+        uart_set_fifo_enabled(midiUART, true);
     }
 
     [[maybe_unused]] void fsTest()
@@ -299,11 +316,71 @@ namespace
     {
         std::string loadFile;
         int loadTrack = -1;
+        bool repeat = false;
+        bool stop = false;
     };
 
     Mutex mutex_;
     Request request_;
     TrackHolder trackHolder_;
+
+    constexpr int MAX_VOLUME = 32768 / 6;
+
+    // 256 * 0.3 = 76.8 db
+    constexpr int VOLTBL_STEPS = 256;
+    constexpr float VOLTBL_STEP_DB = 0.3f;                               // 1 step = 0.1 dB
+    constexpr float VOLTBL_MAX_DB = (VOLTBL_STEPS - 1) * VOLTBL_STEP_DB; // ≒25.5 dB
+
+    constexpr float db_to_gain(float attenuation_db)
+    {
+        return std::pow(10.0f, -attenuation_db / 20.0f);
+    }
+
+    constexpr std::array<uint16_t, VOLTBL_STEPS> volumeTable_ = []()
+    {
+        std::array<uint16_t, VOLTBL_STEPS> tbl = {};
+        for (int i = 0; i < VOLTBL_STEPS; ++i)
+        {
+            float attenuation = (VOLTBL_STEPS - 1 - i) * VOLTBL_STEP_DB;
+            float gain = db_to_gain(attenuation);
+            tbl[i] = i == 0 ? 0 : static_cast<uint16_t>(gain * MAX_VOLUME + 0.5f);
+        }
+        return tbl;
+    }();
+
+    int volumeIndex_ = VOLTBL_STEPS - 1; // MAX
+    int fadeSpeed8_ = 0;                 // 1s あたりの volume変化*8
+    int fade8_ = 0;
+
+    void setVolume(float db)
+    {
+        volumeIndex_ = std::clamp(static_cast<int>(VOLTBL_STEPS - 1 + db / VOLTBL_STEP_DB), 0, VOLTBL_STEPS - 1);
+    }
+
+    void setFadeSpeed(float fadeDBPerSec)
+    {
+        fadeSpeed8_ = static_cast<int>(fadeDBPerSec * 8 / VOLTBL_STEP_DB);
+    }
+
+    void resetFade()
+    {
+        fadeSpeed8_ = 0;
+        fade8_ = 0;
+    }
+
+    void updateFade(size_t sampleCount, size_t sampleRate)
+    {
+        if (fadeSpeed8_ > 0 && fade8_ < volumeIndex_ * 8)
+        {
+            fade8_ += fadeSpeed8_ * sampleCount / sampleRate;
+        }
+    }
+
+    int getLinearVolume()
+    {
+        int i = std::clamp(volumeIndex_ - (fade8_ >> 3), 0, VOLTBL_STEPS - 1);
+        return volumeTable_[i];
+    }
 
     constexpr size_t MP3_WORKING_SIZE = 16000;
     constexpr size_t MP3_DECODE_BUFFER_SIZE = WAVE_BUFFER_SIZE * 2;
@@ -334,6 +411,7 @@ namespace
         void open(const std::string &filename)
         {
             close();
+            resetFade();
 
             if (!musicFileCreate(&mf_, filename.c_str(), mp3Working_, MP3_WORKING_SIZE))
             {
@@ -377,7 +455,8 @@ namespace
                     const auto *src = mp3DecodeBuffer_;
                     auto *srcTail = src + written;
 
-                    int scale = 32768 / 6;
+                    int scale = getLinearVolume();
+
                     if (nChannels_ == 2)
                     {
                         // Stereo
@@ -401,6 +480,9 @@ namespace
                         } while (src < srcTail);
                         wb.size = written;
                     }
+
+                    updateFade(wb.size, sampleRate_);
+
                     nextWaveIn();
 
                     if (!dmaTransferInProgress_)
@@ -457,11 +539,112 @@ namespace
                     printf("Track %d not found\n", req.loadTrack);
                 }
             }
+            else if (req.stop)
+            {
+                printf("Request to stop playback\n");
+                player.close();
+            }
 
             player.tick();
         }
     }
 
+}
+
+void processMIDI(io::MidiMessage &m)
+{
+    m.dump();
+
+    int statusKind = m.data[0] >> 4;
+    int ch = (m.data[0] & 0x0f) + 1;
+    switch (statusKind)
+    {
+    case 0x9: // Note On
+        if (m.size >= 3)
+
+        {
+            int note = m.data[1];
+            if (note > 0x3c)
+            {
+                int num = note - 0x3c; // C4
+                printf("play %d\n", num);
+                Request r;
+                r.loadTrack = num;
+                setRequest(std::move(r));
+            }
+            else if (note == 0x3c)
+            {
+                printf("stop\n");
+                Request r;
+                r.stop = true;
+                setRequest(std::move(r));
+            }
+            else if (note == 0x3b)
+            {
+                printf("fadeout\n");
+                int v = 100;
+                int speed = 4000 / v;
+
+                setFadeSpeed(speed);
+            }
+        }
+        break;
+
+    case 0xa: // Aftertouch
+    {
+        int note = m.data[1];
+        int pressure = m.data[2];
+        // Play command
+        if (m.size >= 3 && ch >= 15)
+        {
+            if (note == 16 || note == 111)
+            {
+                if (pressure > 0)
+                {
+                    Request r;
+                    r.loadTrack = pressure;
+
+                    // Activate repeat if channel 16
+                    constexpr bool ENABLE_SPIKEOUT = false;
+                    if (ch == 16 || ENABLE_SPIKEOUT)
+                    {
+                        r.repeat = true;
+                    }
+                    printf("CMD: BGM #%d repeat %d\n", r.loadTrack, r.repeat);
+                    setRequest(std::move(r));
+                }
+                else
+                {
+                    printf("CMD: BGM #0 STOP\n");
+                    Request r;
+                    r.stop = true;
+                    setRequest(std::move(r));
+                }
+            }
+        }
+
+        // Volume command
+        if (note == 1 || note == 2)
+        {
+            // volume は最大90
+            printf("CMD: Volume change. %d\n", pressure);
+            setVolume((pressure - 90) / 3.0f); // 全体で-30dbにしてみる
+        }
+
+        // Fadeout command
+        if (note == 3 || note == 4)
+        {
+            if (pressure > 0)
+            {
+                // pressure ms で -4db
+                float speed = 4 * 1000 / pressure;
+                printf("CMD: Fadeout. %d, %f\n", pressure, speed);
+                setFadeSpeed(speed);
+            }
+        }
+    }
+    break;
+    }
 }
 
 void __not_in_flash_func(core0_main)()
@@ -473,6 +656,16 @@ void __not_in_flash_func(core0_main)()
         setRequest(std::move(r));
     }
 
+#if 1
+    io::MidiMessageMaker midiMaker;
+
+    while (1)
+    {
+        auto data = uart_getc(midiUART);
+        midiMaker.analyze(data, [&](const io::MidiMessage &m)
+                          { processMIDI(const_cast<io::MidiMessage &>(m)); });
+    }
+#else
     std::string str;
     while (1)
     {
@@ -500,6 +693,7 @@ void __not_in_flash_func(core0_main)()
             str.push_back(ch);
         }
     }
+#endif
 }
 
 int main()
@@ -530,6 +724,8 @@ int main()
     initI2S();
 
     enableIRQI2SDMA(true);
+
+    initMIDI();
 
     multicore_launch_core1(core1_main);
     core0_main();

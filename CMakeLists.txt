@@ -28,6 +28,7 @@ pico_sdk_init()
 add_executable(sega-dsb-clone-sq
   main.cpp
   hw_config.cpp
+  midi.cpp
   thirdparty/picomp3lib/interface/music_file.c
   )
 
