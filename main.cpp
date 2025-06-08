@@ -553,7 +553,9 @@ namespace
 
 void processMIDI(io::MidiMessage &m)
 {
+#ifndef NDEBUG
     m.dump();
+#endif
 
     int statusKind = m.data[0] >> 4;
     int ch = (m.data[0] & 0x0f) + 1;
